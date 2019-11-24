@@ -445,7 +445,7 @@ class ECPrivkey(ECPubkey):
         sig65, recid = bruteforce_recid(sig_string)
         return sig65
 
-    def decrypt_message(self, encrypted: Union[str, bytes], magic: bytes=b'BIE1') -> bytes:
+    def _decode_encrypted(self, encrypted: Union[str, bytes], magic: bytes=b'BIE1') -> bytes:
         encrypted = base64.b64decode(encrypted)  # type: bytes
         if len(encrypted) < 85:
             raise Exception('invalid ciphertext: length')
@@ -467,7 +467,26 @@ class ECPrivkey(ECPubkey):
         iv, key_e, key_m = key[0:16], key[16:32], key[32:]
         if mac != hmac_oneshot(key_m, encrypted[:-32], hashlib.sha256):
             raise InvalidPassword()
+        return key_e, key_m, iv, ciphertext, ephemeral_pubkey_bytes
+
+    def decrypt_message(self, encrypted: Union[str, bytes], magic: bytes=b'BIE1') -> bytes:
+        key_e, key_m, iv, ciphertext, ephemeral_pubkey_bytes = self._decode_encrypted(encrypted, magic)
         return aes_decrypt_with_iv(key_e, iv, ciphertext)
+
+    def append_to_encrypted_message(self, encrypted:str, message: bytes, magic: bytes = b'BIE1') -> bytes:
+        # use the second to last block as the iv to decrypt the last block
+        key_e, key_m, iv, ciphertext, ephemeral_pubkey_bytes = self._decode_encrypted(encrypted, magic)
+        assert_bytes(message)
+        assert len(ciphertext) % 16 == 0
+        iv2 = iv if len(ciphertext)==16 else ciphertext[-32:-16]
+        last = ciphertext[-16:]
+        decoded_last = aes_decrypt_with_iv(key_e, iv2, last)
+        assert last == aes_encrypt_with_iv(key_e, iv2, decoded_last)
+        ciphertext2 = aes_encrypt_with_iv(key_e, iv2, decoded_last+message)
+        ciphertext = ciphertext[0:-16] + ciphertext2
+        encrypted = magic + ephemeral_pubkey_bytes + ciphertext
+        mac = hmac_oneshot(key_m, encrypted, hashlib.sha256)
+        return base64.b64encode(encrypted + mac)
 
 
 def construct_sig65(sig_string: bytes, recid: int, is_compressed: bool) -> bytes:

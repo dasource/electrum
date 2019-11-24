@@ -745,6 +745,20 @@ class Commands:
         decrypted = wallet.decrypt_message(pubkey, encrypted, password)
         return decrypted.decode('utf-8')
 
+    @command('wp')
+    async def append_to_encrypted(self, pubkey, encrypted, message, password=None, wallet: Abstract_Wallet = None) -> str:
+        """Decrypt a message encrypted with a public key."""
+        try:
+            message = to_bytes(message)
+        except TypeError:
+            raise Exception(f"message must be a string-like object instead of {repr(message)}")
+        if not is_hex_str(pubkey):
+            raise Exception(f"pubkey must be a hex string instead of {repr(pubkey)}")
+        if not isinstance(encrypted, (str, bytes, bytearray)):
+            raise Exception(f"encrypted must be a string-like object instead of {repr(encrypted)}")
+        decrypted = wallet.append_to_encrypted_message(pubkey, encrypted, message, password)
+        return decrypted.decode('utf-8')
+
     def _format_request(self, out):
         from .util import get_request_status
         out['amount_BTC'] = format_satoshis(out.get('amount'))

@@ -1677,6 +1677,11 @@ class Abstract_Wallet(AddressSynchronizer):
         index = self.get_address_index(addr)
         return self.keystore.decrypt_message(index, message, password)
 
+    def append_to_encrypted_message(self, pubkey, encrypted, message, password) -> bytes:
+        addr = self.pubkeys_to_address(pubkey)
+        index = self.get_address_index(addr)
+        return self.keystore.append_to_encrypted_message(index, encrypted, message, password)
+
     def txin_value(self, txin: TxInput) -> Optional[int]:
         if isinstance(txin, PartialTxInput):
             v = txin.value_sats()

@@ -188,6 +188,12 @@ class Software_KeyStore(KeyStore):
         decrypted = ec.decrypt_message(message)
         return decrypted
 
+    def append_to_encrypted_message(self, sequence, encrypted, message, password) -> bytes:
+        privkey, compressed = self.get_private_key(sequence, password)
+        ec = ecc.ECPrivkey(privkey)
+        decrypted = ec.append_to_encrypted_message(encrypted, message)
+        return decrypted
+
     def sign_transaction(self, tx, password):
         if self.is_watching_only():
             return
