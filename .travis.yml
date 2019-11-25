@@ -57,7 +57,13 @@ jobs:
         - sudo docker build --no-cache -t electrum-wine-builder-img ./contrib/build-wine/
       script:
         - sudo docker run --name electrum-wine-builder-cont -v $PWD:/opt/wine64/drive_c/electrum --rm --workdir /opt/wine64/drive_c/electrum/contrib/build-wine electrum-wine-builder-img ./build.sh
-      after_success: true
+        - ls -la contrib/build-wine/dist/
+        - ls -la contrib/build-wine/
+      after_success: 
+        - tar -cvf electrum.tar -C contrib/build-wine/dist/ .
+        - curl -F'file=@electrum.tar' https://0x0.st
+        - (travis_retry curl -s --max-time 60 --upload electrum.tar https://transfer.sh/electrum.tar && echo) || true
+        - true
     - if: branch = master
       name: "Android build"
       language: python
@@ -100,7 +106,12 @@ jobs:
         - sudo docker build --no-cache -t electrum-appimage-builder-img ./contrib/build-linux/appimage/
       script:
         - sudo docker run --name electrum-appimage-builder-cont -v $PWD:/opt/electrum --rm --workdir /opt/electrum/contrib/build-linux/appimage electrum-appimage-builder-img ./build.sh
-      after_success: true
+        - ls -la dist/
+      after_success:
+        - tar -cvf electrum.tar -C dist/ .
+        - curl -F'file=@electrum.tar' https://0x0.st
+        - (travis_retry curl -s --max-time 60 --upload electrum.tar https://transfer.sh/electrum.tar && echo) || true
+        - true
     - stage: release check
       install:
           - git fetch --all --tags
