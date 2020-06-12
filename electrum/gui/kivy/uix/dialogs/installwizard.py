@@ -2,6 +2,7 @@
 from functools import partial
 import threading
 import os
+from typing import TYPE_CHECKING
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -24,11 +25,11 @@ from . import EventsDialog
 from ...i18n import _
 from .password_dialog import PasswordDialog
 
+if TYPE_CHECKING:
+    from electrum.gui.kivy.main_window import ElectrumWindow
+
+
 # global Variables
-is_test = (platform == "linux")
-test_seed = "grape impose jazz bind spatial mind jelly tourist tank today holiday stomach"
-test_seed = "time taxi field recycle tiny license olive virus report rare steel portion achieve"
-test_xpub = "xpub661MyMwAqRbcEbvVtRRSjqxVnaWVUMewVzMiURAKyYratih4TtBpMypzzefmv8zUNebmNVzB3PojdC5sV2P9bDgMoo9B3SARw1MXUUfU1GL"
 
 Builder.load_string('''
 #:import Window kivy.core.window.Window
@@ -149,6 +150,18 @@ Builder.load_string('''
             range: 1, n.value
             step: 1
             value: 2
+    Widget
+        size_hint: 1, 1
+    Label:
+        id: backup_warning_label
+        color: root.text_color
+        size_hint: 1, None
+        text_size: self.width, None
+        height: self.texture_size[1]
+        opacity: int(m.value != n.value)
+        text: _("Warning: to be able to restore a multisig wallet, " \
+                "you should include the master public key for each cosigner " \
+                "in all of your backups.")
 
 
 <WizardChoiceDialog>
@@ -633,7 +646,7 @@ class WizardDialog(EventsDialog):
         self._on_release = True
         self.close()
         if not button:
-            self.parent.dispatch('on_wizard_complete', None)
+            self.parent.dispatch('on_wizard_complete', None, None)
             return
         if button is self.ids.back:
             self.wizard.go_back()
@@ -859,9 +872,9 @@ class RestoreSeedDialog(WizardDialog):
         super(RestoreSeedDialog, self).__init__(wizard, **kwargs)
         self._test = kwargs['test']
         from electrum.mnemonic import Mnemonic
-        from electrum.old_mnemonic import words as old_wordlist
+        from electrum.old_mnemonic import wordlist as old_wordlist
         self.words = set(Mnemonic('en').wordlist).union(set(old_wordlist))
-        self.ids.text_input_seed.text = test_seed if is_test else ''
+        self.ids.text_input_seed.text = ''
         self.message = _('Please type your seed phrase using the virtual keyboard.')
         self.title = _('Enter Seed')
         self.ext = False
@@ -1038,7 +1051,7 @@ class AddXpubDialog(WizardDialog):
         self.app.scan_qr(on_complete)
 
     def do_paste(self):
-        self.ids.text_input.text = test_xpub if is_test else self.app._clipboard.paste()
+        self.ids.text_input.text = self.app._clipboard.paste()
 
     def do_clear(self):
         self.ids.text_input.text = ''
@@ -1055,7 +1068,7 @@ class InstallWizard(BaseWizard, Widget):
 
     __events__ = ('on_wizard_complete', )
 
-    def on_wizard_complete(self, wallet):
+    def on_wizard_complete(self, storage, db):
         """overriden by main_window"""
         pass
 
@@ -1086,10 +1099,10 @@ class InstallWizard(BaseWizard, Widget):
         t = threading.Thread(target = target)
         t.start()
 
-    def terminate(self, *, storage=None, aborted=False):
+    def terminate(self, *, storage=None, db=None, aborted=False):
         if storage is None and not aborted:
-            storage = self.create_storage(self.path)
-        self.dispatch('on_wizard_complete', storage)
+            storage, db = self.create_storage(self.path)
+        self.dispatch('on_wizard_complete', storage, db)
 
     def choice_dialog(self, **kwargs):
         choices = kwargs['choices']
@@ -1141,7 +1154,7 @@ class InstallWizard(BaseWizard, Widget):
     def show_message(self, msg): self.show_error(msg)
 
     def show_error(self, msg):
-        app = App.get_running_app()
+        app = App.get_running_app()  # type: ElectrumWindow
         Clock.schedule_once(lambda dt: app.show_error(msg))
 
     def request_password(self, run_next, force_disable_encrypt_cb=False):
@@ -1149,15 +1162,21 @@ class InstallWizard(BaseWizard, Widget):
             # do not request PIN for watching-only wallets
             run_next(None, False)
             return
-        def on_success(old_pin, pin):
-            assert old_pin is None
-            run_next(pin, False)
+        def on_success(old_pw, pw):
+            assert old_pw is None
+            run_next(pw, True)
         def on_failure():
-            self.show_error(_('PIN mismatch'))
+            self.show_error(_('Password mismatch'))
             self.run('request_password', run_next)
-        popup = PasswordDialog()
         app = App.get_running_app()
-        popup.init(app, None, _('Choose PIN code'), on_success, on_failure, is_change=2)
+        popup = PasswordDialog(
+            app,
+            check_password=lambda x:True,
+            on_success=on_success,
+            on_failure=on_failure,
+            is_change=True,
+            is_password=True,
+            message=_('Choose a password'))
         popup.open()
 
     def action_dialog(self, action, run_next):

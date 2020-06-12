@@ -43,6 +43,7 @@ from electrum.gui.qt.transaction_dialog import show_transaction, TxDialog
 from electrum.gui.qt.util import WaitingDialog
 
 if TYPE_CHECKING:
+    from electrum.gui.qt import ElectrumGui
     from electrum.gui.qt.main_window import ElectrumWindow
 
 
@@ -101,9 +102,13 @@ class Plugin(BasePlugin):
         self.obj.cosigner_receive_signal.connect(self.on_receive)
         self.keys = []  # type: List[Tuple[str, str, ElectrumWindow]]
         self.cosigner_list = []  # type: List[Tuple[ElectrumWindow, str, bytes, str]]
+        self._init_qt_received = False
 
     @hook
-    def init_qt(self, gui):
+    def init_qt(self, gui: 'ElectrumGui'):
+        if self._init_qt_received:  # only need/want the first signal
+            return
+        self._init_qt_received = True
         for window in gui.windows:
             self.on_new_window(window)
 
@@ -153,7 +158,7 @@ class Plugin(BasePlugin):
 
     @hook
     def transaction_dialog_update(self, d: 'TxDialog'):
-        if d.tx.is_complete() or d.wallet.can_sign(d.tx):
+        if not d.finalized or d.tx.is_complete() or d.wallet.can_sign(d.tx):
             d.cosigner_send_button.setVisible(False)
             return
         for window, xpub, K, _hash in self.cosigner_list:
@@ -164,12 +169,10 @@ class Plugin(BasePlugin):
             d.cosigner_send_button.setVisible(False)
 
     def cosigner_can_sign(self, tx: Transaction, cosigner_xpub: str) -> bool:
-        if not isinstance(tx, PartialTransaction):
-            return False
-        if tx.is_complete():
-            return False
-        # TODO this is broken currently as it assumes tx.xpubs
-        return cosigner_xpub in {bip32node.to_xpub() for bip32node in tx.xpubs}
+        # TODO implement this properly:
+        #      should return True iff cosigner (with given xpub) can sign and has not yet signed.
+        #      note that tx could also be unrelated from wallet?... (not ismine inputs)
+        return True
 
     def do_send(self, tx: Union[Transaction, PartialTransaction]):
         def on_success(result):

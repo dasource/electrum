@@ -4,7 +4,7 @@ from decimal import Decimal
 import re
 import threading
 import traceback, sys
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 from kivy.app import App
 from kivy.cache import Cache
@@ -24,15 +24,16 @@ from kivy.utils import platform
 from kivy.logger import Logger
 
 from electrum.util import profiler, parse_URI, format_time, InvalidPassword, NotEnoughFunds, Fiat
-from electrum.util import PR_TYPE_ONCHAIN, PR_TYPE_LN
+from electrum.invoices import (PR_TYPE_ONCHAIN, PR_TYPE_LN, PR_DEFAULT_EXPIRATION_WHEN_CREATING,
+                               PR_PAID, PR_UNKNOWN, PR_EXPIRED, PR_INFLIGHT,
+                               LNInvoice, pr_expiration_values)
 from electrum import bitcoin, constants
 from electrum.transaction import Transaction, tx_from_any, PartialTransaction, PartialTxOutput
-from electrum.util import (parse_URI, InvalidBitcoinURI, PR_PAID, PR_UNKNOWN, PR_EXPIRED,
-                           PR_INFLIGHT, TxMinedInfo, get_request_status, pr_expiration_values,
-                           maybe_extract_bolt11_invoice)
+from electrum.util import parse_URI, InvalidBitcoinURI, TxMinedInfo, maybe_extract_bolt11_invoice
 from electrum.plugin import run_hook
 from electrum.wallet import InternalAddressCorruption
 from electrum import simple_config
+from electrum.simple_config import FEERATE_WARNING_HIGH_FEE, FEE_RATIO_HIGH_WARNING
 from electrum.lnaddr import lndecode
 from electrum.lnutil import RECEIVED, SENT, PaymentFailure
 
@@ -43,6 +44,7 @@ from electrum.gui.kivy.i18n import _
 
 if TYPE_CHECKING:
     from electrum.gui.kivy.main_window import ElectrumWindow
+    from electrum.paymentrequest import PaymentRequest
 
 
 class HistoryRecycleView(RecycleView):
@@ -57,19 +59,8 @@ class PaymentRecycleView(RecycleView):
 class CScreen(Factory.Screen):
     __events__ = ('on_activate', 'on_deactivate', 'on_enter', 'on_leave')
     action_view = ObjectProperty(None)
-    loaded = False
     kvname = None
     app = App.get_running_app()  # type: ElectrumWindow
-
-    def _change_action_view(self):
-        app = App.get_running_app()
-        action_bar = app.root.manager.current_screen.ids.action_bar
-        _action_view = self.action_view
-
-        if (not _action_view) or _action_view.parent:
-            return
-        action_bar.clear_widgets()
-        action_bar.add_widget(_action_view)
 
     def on_enter(self):
         # FIXME: use a proper event don't use animation time of screen
@@ -79,18 +70,9 @@ class CScreen(Factory.Screen):
     def update(self):
         pass
 
-    @profiler
-    def load_screen(self):
-        self.screen = Builder.load_file('electrum/gui/kivy/uix/ui_screens/' + self.kvname + '.kv')
-        self.add_widget(self.screen)
-        self.loaded = True
-        self.update()
-        setattr(self.app, self.kvname + '_screen', self)
-
     def on_activate(self):
-        if self.kvname and not self.loaded:
-            self.load_screen()
-        #Clock.schedule_once(lambda dt: self._change_action_view())
+        setattr(self.app, self.kvname + '_screen', self)
+        self.update()
 
     def on_leave(self):
         self.dispatch('on_deactivate')
@@ -113,6 +95,12 @@ TX_ICONS = [
     "confirmed",
 ]
 
+
+Builder.load_file('electrum/gui/kivy/uix/ui_screens/history.kv')
+Builder.load_file('electrum/gui/kivy/uix/ui_screens/send.kv')
+Builder.load_file('electrum/gui/kivy/uix/ui_screens/receive.kv')
+
+
 class HistoryScreen(CScreen):
 
     tab = ObjectProperty(None)
@@ -125,7 +113,14 @@ class HistoryScreen(CScreen):
 
     def show_item(self, obj):
         key = obj.key
-        tx = self.app.wallet.db.get_transaction(key)
+        tx_item = self.history.get(key)
+        if tx_item.get('lightning') and tx_item['type'] == 'payment':
+            self.app.lightning_tx_dialog(tx_item)
+            return
+        if tx_item.get('lightning'):
+            tx = self.app.wallet.lnworker.lnwatcher.db.get_transaction(key)
+        else:
+            tx = self.app.wallet.db.get_transaction(key)
         if not tx:
             return
         self.app.tx_dialog(tx)
@@ -136,7 +131,6 @@ class HistoryScreen(CScreen):
         key = tx_item.get('txid') or tx_item['payment_hash']
         if is_lightning:
             status = 0
-            txpos = tx_item['txpos']
             status_str = 'unconfirmed' if timestamp is None else format_time(int(timestamp))
             icon = "atlas://electrum/gui/kivy/theming/light/lightning"
             message = tx_item['label']
@@ -146,8 +140,6 @@ class HistoryScreen(CScreen):
         else:
             tx_hash = tx_item['txid']
             conf = tx_item['confirmations']
-            txpos = tx_item['txpos_in_block'] or 0
-            height = tx_item['height']
             tx_mined_info = TxMinedInfo(height=tx_item['height'],
                                         conf=tx_item['confirmations'],
                                         timestamp=tx_item['timestamp'])
@@ -175,19 +167,20 @@ class HistoryScreen(CScreen):
         wallet = self.app.wallet
         if wallet is None:
             return
-        history = sorted(wallet.get_full_history(self.app.fx).values(), key=lambda x: x.get('timestamp') or float('inf'), reverse=True)
-        history_card = self.screen.ids.history_container
+        self.history = wallet.get_full_history(self.app.fx)
+        history = reversed(self.history.values())
+        history_card = self.ids.history_container
         history_card.data = [self.get_card(item) for item in history]
 
 
 class SendScreen(CScreen):
 
     kvname = 'send'
-    payment_request = None
-    payment_request_queued = None
+    payment_request = None  # type: Optional[PaymentRequest]
+    payment_request_queued = None  # type: Optional[str]
     parsed_URI = None
 
-    def set_URI(self, text):
+    def set_URI(self, text: str):
         if not self.app.wallet:
             self.payment_request_queued = text
             return
@@ -198,11 +191,11 @@ class SendScreen(CScreen):
             return
         self.parsed_URI = uri
         amount = uri.get('amount')
-        self.screen.address = uri.get('address', '')
-        self.screen.message = uri.get('message', '')
-        self.screen.amount = self.app.format_amount_and_units(amount) if amount else ''
+        self.address = uri.get('address', '')
+        self.message = uri.get('message', '')
+        self.amount = self.app.format_amount_and_units(amount) if amount else ''
         self.payment_request = None
-        self.screen.is_lightning = False
+        self.is_lightning = False
 
     def set_ln_invoice(self, invoice):
         try:
@@ -211,64 +204,65 @@ class SendScreen(CScreen):
         except Exception as e:
             self.app.show_info(invoice + _(" is not a valid Lightning invoice: ") + repr(e)) # repr because str(Exception()) == ''
             return
-        self.screen.address = invoice
-        self.screen.message = dict(lnaddr.tags).get('d', None)
-        self.screen.amount = self.app.format_amount_and_units(lnaddr.amount * bitcoin.COIN) if lnaddr.amount else ''
+        self.address = invoice
+        self.message = dict(lnaddr.tags).get('d', None)
+        self.amount = self.app.format_amount_and_units(lnaddr.amount * bitcoin.COIN) if lnaddr.amount else ''
         self.payment_request = None
-        self.screen.is_lightning = True
+        self.is_lightning = True
 
     def update(self):
-        if not self.loaded:
+        if self.app.wallet is None:
             return
-        if self.app.wallet and self.payment_request_queued:
+        if self.payment_request_queued:
             self.set_URI(self.payment_request_queued)
             self.payment_request_queued = None
         _list = self.app.wallet.get_invoices()
-        lnworker_logs = self.app.wallet.lnworker.logs if self.app.wallet.lnworker else {}
-        _list = [x for x in _list if x and x.get('status') != PR_PAID or x.get('rhash') in lnworker_logs]
-        payments_container = self.screen.ids.payments_container
+        _list.reverse()
+        payments_container = self.ids.payments_container
         payments_container.data = [self.get_card(item) for item in _list]
 
     def show_item(self, obj):
         self.app.show_invoice(obj.is_lightning, obj.key)
 
     def get_card(self, item):
-        invoice_type = item['type']
-        status, status_str = get_request_status(item) # convert to str
-        if invoice_type == PR_TYPE_LN:
-            key = item['rhash']
+        status = self.app.wallet.get_invoice_status(item)
+        status_str = item.get_status_str(status)
+        is_lightning = item.type == PR_TYPE_LN
+        if is_lightning:
+            key = item.rhash
             log = self.app.wallet.lnworker.logs.get(key)
-            if item['status'] == PR_INFLIGHT and log:
+            if status == PR_INFLIGHT and log:
                 status_str += '... (%d)'%len(log)
-        elif invoice_type == PR_TYPE_ONCHAIN:
-            key = item['id']
+            is_bip70 = False
         else:
-            raise Exception('unknown invoice type')
+            key = item.id
+            is_bip70 = bool(item.bip70)
         return {
-            'is_lightning': invoice_type == PR_TYPE_LN,
-            'is_bip70': 'bip70' in item,
+            'is_lightning': is_lightning,
+            'is_bip70': is_bip70,
             'screen': self,
             'status': status,
             'status_str': status_str,
             'key': key,
-            'memo': item['message'],
-            'amount': self.app.format_amount_and_units(item['amount'] or 0),
+            'memo': item.message,
+            'amount': self.app.format_amount_and_units(item.amount or 0),
         }
 
     def do_clear(self):
-        self.screen.amount = ''
-        self.screen.message = ''
-        self.screen.address = ''
+        self.amount = ''
+        self.message = ''
+        self.address = ''
         self.payment_request = None
-        self.screen.locked = False
+        self.is_lightning = False
+        self.is_bip70 = False
         self.parsed_URI = None
 
-    def set_request(self, pr):
-        self.screen.address = pr.get_requestor()
+    def set_request(self, pr: 'PaymentRequest'):
+        self.address = pr.get_requestor()
         amount = pr.get_amount()
-        self.screen.amount = self.app.format_amount_and_units(amount) if amount else ''
-        self.screen.message = pr.get_memo()
-        self.screen.locked = True
+        self.amount = self.app.format_amount_and_units(amount) if amount else ''
+        self.message = pr.get_memo()
+        self.locked = True
         self.payment_request = pr
 
     def do_paste(self):
@@ -293,27 +287,34 @@ class SendScreen(CScreen):
             self.set_URI(data)
 
     def read_invoice(self):
-        address = str(self.screen.address)
+        address = str(self.address)
         if not address:
             self.app.show_error(_('Recipient not specified.') + ' ' + _('Please scan a Bitcoin address or a payment request'))
             return
-        if not self.screen.amount:
+        if not self.amount:
             self.app.show_error(_('Please enter an amount'))
             return
         try:
-            amount = self.app.get_amount(self.screen.amount)
+            amount = self.app.get_amount(self.amount)
         except:
-            self.app.show_error(_('Invalid amount') + ':\n' + self.screen.amount)
+            self.app.show_error(_('Invalid amount') + ':\n' + self.amount)
             return
-        message = self.screen.message
-        if self.screen.is_lightning:
-            return self.app.wallet.lnworker.parse_bech32_invoice(address)
-        else:
-            if not bitcoin.is_address(address):
-                self.app.show_error(_('Invalid Bitcoin Address') + ':\n' + address)
-                return
-            outputs = [PartialTxOutput.from_address_and_value(address, amount)]
-            return self.app.wallet.create_invoice(outputs, message, self.payment_request, self.parsed_URI)
+        message = self.message
+        if self.is_lightning:
+            return LNInvoice.from_bech32(address)
+        else:  # on-chain
+            if self.payment_request:
+                outputs = self.payment_request.get_outputs()
+            else:
+                if not bitcoin.is_address(address):
+                    self.app.show_error(_('Invalid Bitcoin Address') + ':\n' + address)
+                    return
+                outputs = [PartialTxOutput.from_address_and_value(address, amount)]
+            return self.app.wallet.create_invoice(
+                outputs=outputs,
+                message=message,
+                pr=self.payment_request,
+                URI=self.parsed_URI)
 
     def do_save(self):
         invoice = self.read_invoice()
@@ -333,27 +334,27 @@ class SendScreen(CScreen):
         self.do_pay_invoice(invoice)
 
     def do_pay_invoice(self, invoice):
-        if invoice['type'] == PR_TYPE_LN:
+        if invoice.is_lightning():
             self._do_pay_lightning(invoice)
             return
-        elif invoice['type'] == PR_TYPE_ONCHAIN:
+        else:
             do_pay = lambda rbf: self._do_pay_onchain(invoice, rbf)
             if self.app.electrum_config.get('use_rbf'):
                 d = Question(_('Should this transaction be replaceable?'), do_pay)
                 d.open()
             else:
                 do_pay(False)
-        else:
-            raise Exception('unknown invoice type')
 
     def _do_pay_lightning(self, invoice):
         attempts = 10
-        threading.Thread(target=self.app.wallet.lnworker.pay, args=(invoice['invoice'], invoice['amount'], attempts)).start()
+        threading.Thread(
+            target=self.app.wallet.lnworker.pay,
+            args=(invoice.invoice, invoice.amount),
+            kwargs={'attempts':10}).start()
 
     def _do_pay_onchain(self, invoice, rbf):
         # make unsigned transaction
-        outputs = invoice['outputs']  # type: List[PartialTxOutput]
-        amount = sum(map(lambda x: x.value, outputs))
+        outputs = invoice.outputs  # type: List[PartialTxOutput]
         coins = self.app.wallet.get_spendable_coins(None)
         try:
             tx = self.app.wallet.make_unsigned_transaction(coins=coins, outputs=outputs)
@@ -367,6 +368,7 @@ class SendScreen(CScreen):
         if rbf:
             tx.set_rbf(True)
         fee = tx.get_fee()
+        amount = sum(map(lambda x: x.value, outputs)) if '!' not in [x.value for x in outputs] else tx.output_value()
         msg = [
             _("Amount to be sent") + ": " + self.app.format_amount_and_units(amount),
             _("Mining fee") + ": " + self.app.format_amount_and_units(fee),
@@ -376,18 +378,22 @@ class SendScreen(CScreen):
             x_fee_address, x_fee_amount = x_fee
             msg.append(_("Additional fees") + ": " + self.app.format_amount_and_units(x_fee_amount))
 
-        feerate_warning = simple_config.FEERATE_WARNING_HIGH_FEE
-        if fee > feerate_warning * tx.estimated_size() / 1000:
-            msg.append(_('Warning') + ': ' + _("The fee for this transaction seems unusually high."))
-        msg.append(_("Enter your PIN code to proceed"))
-        self.app.protected('\n'.join(msg), self.send_tx, (tx, invoice))
+        feerate = Decimal(fee) / tx.estimated_size()  # sat/byte
+        fee_ratio = Decimal(fee) / amount if amount else 1
+        if fee_ratio >= FEE_RATIO_HIGH_WARNING:
+            msg.append(_('Warning') + ': ' + _("The fee for this transaction seems unusually high.")
+                       + f' ({fee_ratio*100:.2f}% of amount)')
+        elif feerate > FEERATE_WARNING_HIGH_FEE / 1000:
+            msg.append(_('Warning') + ': ' + _("The fee for this transaction seems unusually high.")
+                       + f' (feerate: {feerate:.2f} sat/byte)')
+        self.app.protected('\n'.join(msg), self.send_tx, (tx,))
 
-    def send_tx(self, tx, invoice, password):
+    def send_tx(self, tx, password):
         if self.app.wallet.has_password() and password is None:
             return
         def on_success(tx):
             if tx.is_complete():
-                self.app.broadcast(tx, invoice)
+                self.app.broadcast(tx)
             else:
                 self.app.tx_dialog(tx)
         def on_failure(error):
@@ -398,6 +404,19 @@ class SendScreen(CScreen):
         else:
             self.app.tx_dialog(tx)
 
+    def clear_invoices_dialog(self):
+        invoices = self.app.wallet.get_invoices()
+        if not invoices:
+            return
+        def callback(c):
+            if c:
+                for req in invoices:
+                    key = req.rhash if req.is_lightning() else req.get_address()
+                    self.app.wallet.delete_invoice(key)
+                self.update()
+        n = len(invoices)
+        d = Question(_('Delete {} invoices?').format(n), callback)
+        d.open()
 
 
 class ReceiveScreen(CScreen):
@@ -409,35 +428,35 @@ class ReceiveScreen(CScreen):
         Clock.schedule_interval(lambda dt: self.update(), 5)
 
     def expiry(self):
-        return self.app.electrum_config.get('request_expiry', 3600) # 1 hour
+        return self.app.electrum_config.get('request_expiry', PR_DEFAULT_EXPIRATION_WHEN_CREATING)
 
     def clear(self):
-        self.screen.address = ''
-        self.screen.amount = ''
-        self.screen.message = ''
-        self.screen.lnaddr = ''
+        self.address = ''
+        self.amount = ''
+        self.message = ''
+        self.lnaddr = ''
 
     def set_address(self, addr):
-        self.screen.address = addr
+        self.address = addr
 
     def on_address(self, addr):
         req = self.app.wallet.get_request(addr)
-        self.screen.status = ''
+        self.status = ''
         if req:
-            self.screen.message = req.get('memo', '')
+            self.message = req.get('memo', '')
             amount = req.get('amount')
-            self.screen.amount = self.app.format_amount_and_units(amount) if amount else ''
+            self.amount = self.app.format_amount_and_units(amount) if amount else ''
             status = req.get('status', PR_UNKNOWN)
-            self.screen.status = _('Payment received') if status == PR_PAID else ''
+            self.status = _('Payment received') if status == PR_PAID else ''
 
     def get_URI(self):
         from electrum.util import create_bip21_uri
-        amount = self.screen.amount
+        amount = self.amount
         if amount:
-            a, u = self.screen.amount.split()
+            a, u = self.amount.split()
             assert u == self.app.base_unit
             amount = Decimal(a) * pow(10, self.app.decimal_point())
-        return create_bip21_uri(self.screen.address, amount, self.screen.message)
+        return create_bip21_uri(self.address, amount, self.message)
 
     def do_copy(self):
         uri = self.get_URI()
@@ -445,17 +464,17 @@ class ReceiveScreen(CScreen):
         self.app.show_info(_('Request copied to clipboard'))
 
     def new_request(self, lightning):
-        amount = self.screen.amount
+        amount = self.amount
         amount = self.app.get_amount(amount) if amount else 0
-        message = self.screen.message
+        message = self.message
         if lightning:
             key = self.app.wallet.lnworker.add_request(amount, message, self.expiry())
         else:
-            addr = self.screen.address or self.app.wallet.get_unused_address()
+            addr = self.address or self.app.wallet.get_unused_address()
             if not addr:
                 self.app.show_info(_('No address available. Please remove some of your pending requests.'))
                 return
-            self.screen.address = addr
+            self.address = addr
             req = self.app.wallet.make_payment_request(addr, amount, message, self.expiry())
             self.app.wallet.add_payment_request(req)
             key = addr
@@ -464,16 +483,17 @@ class ReceiveScreen(CScreen):
         self.app.show_request(lightning, key)
 
     def get_card(self, req):
-        is_lightning = req.get('type') == PR_TYPE_LN
+        is_lightning = req.is_lightning()
         if not is_lightning:
-            address = req['address']
+            address = req.get_address()
             key = address
         else:
-            key = req['rhash']
-            address = req['invoice']
-        amount = req.get('amount')
-        description = req.get('memo', '')
-        status, status_str = get_request_status(req)
+            key = req.rhash
+            address = req.invoice
+        amount = req.amount
+        description = req.message
+        status = self.app.wallet.get_request_status(key)
+        status_str = req.get_status_str(status)
         ci = {}
         ci['screen'] = self
         ci['address'] = address
@@ -481,16 +501,17 @@ class ReceiveScreen(CScreen):
         ci['key'] = key
         ci['amount'] = self.app.format_amount_and_units(amount) if amount else ''
         ci['memo'] = description
-        ci['status'] = status_str
-        ci['is_expired'] = status == PR_EXPIRED
+        ci['status'] = status
+        ci['status_str'] = status_str
         return ci
 
     def update(self):
-        if not self.loaded:
+        if self.app.wallet is None:
             return
         _list = self.app.wallet.get_sorted_requests()
-        requests_container = self.screen.ids.requests_container
-        requests_container.data = [self.get_card(item) for item in _list if item.get('status') != PR_PAID]
+        _list.reverse()
+        requests_container = self.ids.requests_container
+        requests_container.data = [self.get_card(item) for item in _list]
 
     def show_item(self, obj):
         self.app.show_request(obj.is_lightning, obj.key)
@@ -504,16 +525,16 @@ class ReceiveScreen(CScreen):
 
     def clear_requests_dialog(self):
         requests = self.app.wallet.get_sorted_requests()
-        expired = [req for req in requests if get_request_status(req)[0] == PR_EXPIRED]
-        if len(expired) == 0:
+        if not requests:
             return
         def callback(c):
             if c:
-                for req in expired:
+                for req in requests:
                     key = req.get('rhash') or req['address']
                     self.app.wallet.delete_request(key)
                 self.update()
-        d = Question(_('Delete expired requests?'), callback)
+        n = len(requests)
+        d = Question(_('Delete {} requests?').format(n), callback)
         d.open()
 
 

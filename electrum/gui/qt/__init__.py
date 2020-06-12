@@ -28,7 +28,7 @@ import signal
 import sys
 import traceback
 import threading
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, List
 
 
 try:
@@ -48,6 +48,7 @@ from electrum.base_wizard import GoBack
 from electrum.util import (UserCancelled, profiler,
                            WalletFileException, BitcoinException, get_new_wallet_name)
 from electrum.wallet import Wallet, Abstract_Wallet
+from electrum.wallet_db import WalletDB
 from electrum.logging import Logger
 
 from .installwizard import InstallWizard, WalletAlreadyOpenInMemory
@@ -91,6 +92,7 @@ class ElectrumGui(Logger):
     def __init__(self, config: 'SimpleConfig', daemon: 'Daemon', plugins: 'Plugins'):
         set_language(config.get('language', get_default_language()))
         Logger.__init__(self)
+        self.logger.info(f"Qt GUI starting up... Qt={QtCore.QT_VERSION_STR}, PyQt={QtCore.PYQT_VERSION_STR}")
         # Uncomment this call to verify objects are being properly
         # GC-ed when windows are closed
         #network.add_jobs([DebugMem([Abstract_Wallet, SPV, Synchronizer,
@@ -104,7 +106,7 @@ class ElectrumGui(Logger):
         self.config = config
         self.daemon = daemon
         self.plugins = plugins
-        self.windows = []
+        self.windows = []  # type: List[ElectrumWindow]
         self.efilter = OpenFileEventFilter(self.windows)
         self.app = QElectrumApplication(sys.argv)
         self.app.installEventFilter(self.efilter)
@@ -157,9 +159,9 @@ class ElectrumGui(Logger):
             m.clear()
         network = self.daemon.network
         m.addAction(_("Network"), self.show_network_dialog)
-        if network.lngossip:
+        if network and network.lngossip:
             m.addAction(_("Lightning Network"), self.show_lightning_dialog)
-        if network.local_watchtower:
+        if network and network.local_watchtower:
             m.addAction(_("Local Watchtower"), self.show_watchtower_dialog)
         for window in self.windows:
             name = window.wallet.basename()
@@ -205,6 +207,8 @@ class ElectrumGui(Logger):
         self.app.new_window_signal.emit(path, uri)
 
     def show_lightning_dialog(self):
+        if not self.daemon.network.is_lightning_running():
+            return
         if not self.lightning_dialog:
             self.lightning_dialog = LightningDialog(self)
         self.lightning_dialog.bring_to_top()
@@ -299,16 +303,17 @@ class ElectrumGui(Logger):
         return window
 
     def _start_wizard_to_select_or_create_wallet(self, path) -> Optional[Abstract_Wallet]:
-        wizard = InstallWizard(self.config, self.app, self.plugins)
+        wizard = InstallWizard(self.config, self.app, self.plugins, gui_object=self)
         try:
             path, storage = wizard.select_storage(path, self.daemon.get_wallet)
             # storage is None if file does not exist
             if storage is None:
                 wizard.path = path  # needed by trustedcoin plugin
                 wizard.run('new')
-                storage = wizard.create_storage(path)
+                storage, db = wizard.create_storage(path)
             else:
-                wizard.run_upgrades(storage)
+                db = WalletDB(storage.read(), manual_upgrades=False)
+                wizard.run_upgrades(storage, db)
         except (UserCancelled, GoBack):
             return
         except WalletAlreadyOpenInMemory as e:
@@ -316,9 +321,9 @@ class ElectrumGui(Logger):
         finally:
             wizard.terminate()
         # return if wallet creation is not complete
-        if storage is None or storage.get_action():
+        if storage is None or db.get_action():
             return
-        wallet = Wallet(storage, config=self.config)
+        wallet = Wallet(db, storage, config=self.config)
         wallet.start_network(self.daemon.network)
         self.daemon.add_wallet(wallet)
         return wallet
@@ -337,7 +342,7 @@ class ElectrumGui(Logger):
         # Show network dialog if config does not exist
         if self.daemon.network:
             if self.config.get('auto_connect') is None:
-                wizard = InstallWizard(self.config, self.app, self.plugins)
+                wizard = InstallWizard(self.config, self.app, self.plugins, gui_object=self)
                 wizard.init_network(self.daemon.network)
                 wizard.terminate()
 

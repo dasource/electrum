@@ -4,14 +4,14 @@
 #
 import os, time, io
 import traceback
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 import struct
 
 from electrum import bip32
 from electrum.bip32 import BIP32Node, InvalidMasterKeyVersionBytes
 from electrum.i18n import _
 from electrum.plugin import Device, hook
-from electrum.keystore import Hardware_KeyStore
+from electrum.keystore import Hardware_KeyStore, KeyStoreWithMPK
 from electrum.transaction import PartialTransaction
 from electrum.wallet import Standard_Wallet, Multisig_Wallet, Abstract_Wallet
 from electrum.util import bfh, bh2u, versiontuple, UserFacingException
@@ -20,9 +20,6 @@ from electrum.logging import get_logger
 
 from ..hw_wallet import HW_PluginBase, HardwareClientBase
 from ..hw_wallet.plugin import LibraryFoundButUnusable, only_hook_if_libraries_available
-
-if TYPE_CHECKING:
-    from electrum.keystore import Xpub
 
 
 _logger = get_logger(__name__)
@@ -63,7 +60,8 @@ CKCC_SIMULATED_PID = CKCC_PID ^ 0x55aa
 
 class CKCCClient(HardwareClientBase):
 
-    def __init__(self, plugin, handler, dev_path, is_simulator=False):
+    def __init__(self, plugin, handler, dev_path, *, is_simulator=False):
+        HardwareClientBase.__init__(self, plugin=plugin)
         self.device = plugin.device
         self.handler = handler
 
@@ -74,9 +72,9 @@ class CKCCClient(HardwareClientBase):
             self.dev = ElectrumColdcardDevice(dev_path, encrypt=True)
         else:
             # open the real HID device
-            import hid
-            hd = hid.device(path=dev_path)
-            hd.open_path(dev_path)
+            with self.device_manager().hid_lock:
+                hd = hid.device(path=dev_path)
+                hd.open_path(dev_path)
 
             self.dev = ElectrumColdcardDevice(dev=hd, encrypt=True)
 
@@ -129,7 +127,8 @@ class CKCCClient(HardwareClientBase):
 
     def close(self):
         # close the HID device (so can be reused)
-        self.dev.close()
+        with self.device_manager().hid_lock:
+            self.dev.close()
         self.dev = None
 
     def is_initialized(self):
@@ -480,7 +479,7 @@ class ColdcardPlugin(HW_PluginBase):
         if not self.libraries_available:
             return
 
-        self.device_manager().register_devices(self.DEVICE_IDS)
+        self.device_manager().register_devices(self.DEVICE_IDS, plugin=self)
         self.device_manager().register_enumerate_func(self.detect_simulator)
 
     def get_library_version(self):
@@ -518,40 +517,34 @@ class ColdcardPlugin(HW_PluginBase):
         # the 'path' is unabiguous, so we'll use that.
         try:
             rv = CKCCClient(self, handler, device.path,
-                    is_simulator=(device.product_key[1] == CKCC_SIMULATED_PID))
+                            is_simulator=(device.product_key[1] == CKCC_SIMULATED_PID))
             return rv
-        except:
-            self.logger.info('late failure connecting to device?')
+        except Exception as e:
+            self.logger.exception('late failure connecting to device?')
             return None
 
     def setup_device(self, device_info, wizard, purpose):
-        devmgr = self.device_manager()
         device_id = device_info.device.id_
-        client = devmgr.client_by_id(device_id)
-        if client is None:
-            raise UserFacingException(_('Failed to create a client for this device.') + '\n' +
-                                      _('Make sure it is in the correct state.'))
-        client.handler = self.create_handler(wizard)
+        client = self.scan_and_create_client_for_device(device_id=device_id, wizard=wizard)
+        return client
 
     def get_xpub(self, device_id, derivation, xtype, wizard):
         # this seems to be part of the pairing process only, not during normal ops?
         # base_wizard:on_hw_derivation
         if xtype not in self.SUPPORTED_XTYPES:
             raise ScriptTypeNotSupported(_('This type of script is not supported with {}.').format(self.device))
-        devmgr = self.device_manager()
-        client = devmgr.client_by_id(device_id)
-        client.handler = self.create_handler(wizard)
+        client = self.scan_and_create_client_for_device(device_id=device_id, wizard=wizard)
         client.ping_check()
 
         xpub = client.get_xpub(derivation, xtype)
         return xpub
 
-    def get_client(self, keystore, force_pair=True) -> 'CKCCClient':
+    def get_client(self, keystore, force_pair=True, *,
+                   devices=None, allow_user_interaction=True) -> Optional['CKCCClient']:
         # Acquire a connection to the hardware device (via USB)
-        devmgr = self.device_manager()
-        handler = keystore.handler
-        with devmgr.hid_lock:
-            client = devmgr.client_for_keystore(self, handler, keystore, force_pair)
+        client = super().get_client(keystore, force_pair,
+                                    devices=devices,
+                                    allow_user_interaction=allow_user_interaction)
 
         if client is not None:
             client.ping_check()
@@ -571,7 +564,7 @@ class ColdcardPlugin(HW_PluginBase):
 
         xpubs = []
         derivs = set()
-        for xpub, ks in zip(wallet.get_master_public_keys(), wallet.get_keystores()):
+        for xpub, ks in zip(wallet.get_master_public_keys(), wallet.get_keystores()):  # type: str, KeyStoreWithMPK
             fp_bytes, der_full = ks.get_fp_and_derivation_to_be_used_in_partial_tx(der_suffix=[], only_der_suffix=False)
             fp_hex = fp_bytes.hex().upper()
             der_prefix_str = bip32.convert_bip32_intpath_to_strpath(der_full)
@@ -613,15 +606,15 @@ class ColdcardPlugin(HW_PluginBase):
             # all those keys
 
             pubkey_deriv_info = wallet.get_public_keys_with_deriv_info(address)
-            pubkeys = sorted([pk for pk in list(pubkey_deriv_info)])
+            pubkey_hexes = sorted([pk.hex() for pk in list(pubkey_deriv_info)])
             xfp_paths = []
-            for pubkey_hex in pubkey_deriv_info:
-                ks, der_suffix = pubkey_deriv_info[pubkey_hex]
+            for pubkey in pubkey_deriv_info:
+                ks, der_suffix = pubkey_deriv_info[pubkey]
                 fp_bytes, der_full = ks.get_fp_and_derivation_to_be_used_in_partial_tx(der_suffix, only_der_suffix=False)
                 xfp_int = xfp_int_from_xfp_bytes(fp_bytes)
                 xfp_paths.append([xfp_int] + list(der_full))
 
-            script = bfh(wallet.pubkeys_to_scriptcode(pubkeys))
+            script = bfh(wallet.pubkeys_to_scriptcode(pubkey_hexes))
 
             keystore.show_p2sh_address(wallet.m, script, xfp_paths, txin_type)
 

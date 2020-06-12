@@ -34,7 +34,7 @@ from electrum.bitcoin import is_address
 from electrum.util import block_explorer_URL
 from electrum.plugin import run_hook
 
-from .util import MyTreeView, import_meta_gui, export_meta_gui, webopen
+from .util import MyTreeView, webopen
 
 
 class ContactList(MyTreeView):
@@ -62,12 +62,6 @@ class ContactList(MyTreeView):
         _type, prior_name = self.parent.contacts.pop(user_role)
         self.parent.set_contact(text, user_role)
         self.update()
-
-    def import_contacts(self):
-        import_meta_gui(self.parent, _('contacts'), self.parent.contacts.import_file, self.update)
-
-    def export_contacts(self):
-        export_meta_gui(self.parent, _('contacts'), self.parent.contacts.export_file)
 
     def create_menu(self, position):
         menu = QMenu()
@@ -102,6 +96,8 @@ class ContactList(MyTreeView):
         menu.exec_(self.viewport().mapToGlobal(position))
 
     def update(self):
+        if self.maybe_defer_update():
+            return
         current_key = self.current_item_user_role(col=self.Columns.NAME)
         self.model().clear()
         self.update_headers(self.__class__.headers)

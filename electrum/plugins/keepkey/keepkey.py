@@ -9,6 +9,7 @@ from electrum import constants
 from electrum.i18n import _
 from electrum.transaction import Transaction, PartialTransaction, PartialTxInput, PartialTxOutput
 from electrum.keystore import Hardware_KeyStore
+from electrum.plugin import Device
 from electrum.base_wizard import ScriptTypeNotSupported
 
 from ..hw_wallet import HW_PluginBase
@@ -16,7 +17,9 @@ from ..hw_wallet.plugin import (is_any_tx_output_on_change_branch, trezor_valida
                                 get_xpubs_and_der_suffixes_from_txinout)
 
 if TYPE_CHECKING:
+    import usb1
     from .client import KeepKeyClient
+
 
 # TREZOR initialization methods
 TIM_NEW, TIM_RECOVER, TIM_MNEMONIC, TIM_PRIVKEY = range(0, 4)
@@ -84,10 +87,30 @@ class KeepKeyPlugin(HW_PluginBase):
             self.types = keepkeylib.client.types
             self.DEVICE_IDS = (keepkeylib.transport_hid.DEVICE_IDS +
                                keepkeylib.transport_webusb.DEVICE_IDS)
-            self.device_manager().register_devices(self.DEVICE_IDS)
+            # only "register" hid device id:
+            self.device_manager().register_devices(keepkeylib.transport_hid.DEVICE_IDS, plugin=self)
+            # for webusb transport, use custom enumerate function:
+            self.device_manager().register_enumerate_func(self.enumerate)
             self.libraries_available = True
         except ImportError:
             self.libraries_available = False
+
+    def enumerate(self):
+        from keepkeylib.transport_webusb import WebUsbTransport
+        results = []
+        for dev in WebUsbTransport.enumerate():
+            path = self._dev_to_str(dev)
+            results.append(Device(path=path,
+                                  interface_number=-1,
+                                  id_=path,
+                                  product_key=(dev.getVendorID(), dev.getProductID()),
+                                  usage_page=0,
+                                  transport_ui_string=f"webusb:{path}"))
+        return results
+
+    @staticmethod
+    def _dev_to_str(dev: "usb1.USBDevice") -> str:
+        return ":".join(str(x) for x in ["%03i" % (dev.getBusNumber(),)] + dev.getPortNumberList())
 
     def hid_transport(self, pair):
         from keepkeylib.transport_hid import HidTransport
@@ -95,10 +118,9 @@ class KeepKeyPlugin(HW_PluginBase):
 
     def webusb_transport(self, device):
         from keepkeylib.transport_webusb import WebUsbTransport
-        for d in WebUsbTransport.enumerate():
-            if device.id_.startswith(d.getSerialNumber()):
-                return WebUsbTransport(d)
-        return WebUsbTransport(device)
+        for dev in WebUsbTransport.enumerate():
+            if device.path == self._dev_to_str(dev):
+                return WebUsbTransport(dev)
 
     def _try_hid(self, device):
         self.logger.info("Trying to connect over USB...")
@@ -157,11 +179,11 @@ class KeepKeyPlugin(HW_PluginBase):
 
         return client
 
-    def get_client(self, keystore, force_pair=True) -> Optional['KeepKeyClient']:
-        devmgr = self.device_manager()
-        handler = keystore.handler
-        with devmgr.hid_lock:
-            client = devmgr.client_for_keystore(self, handler, keystore, force_pair)
+    def get_client(self, keystore, force_pair=True, *,
+                   devices=None, allow_user_interaction=True) -> Optional['KeepKeyClient']:
+        client = super().get_client(keystore, force_pair,
+                                    devices=devices,
+                                    allow_user_interaction=allow_user_interaction)
         # returns the client for a given keystore. can use xpub
         if client:
             client.used()
@@ -254,25 +276,19 @@ class KeepKeyPlugin(HW_PluginBase):
         return self.types.HDNodePathType(node=node, address_n=address_n)
 
     def setup_device(self, device_info, wizard, purpose):
-        devmgr = self.device_manager()
         device_id = device_info.device.id_
-        client = devmgr.client_by_id(device_id)
-        if client is None:
-            raise UserFacingException(_('Failed to create a client for this device.') + '\n' +
-                                      _('Make sure it is in the correct state.'))
-        # fixme: we should use: client.handler = wizard
-        client.handler = self.create_handler(wizard)
+        client = self.scan_and_create_client_for_device(device_id=device_id, wizard=wizard)
         if not device_info.initialized:
             self.initialize_device(device_id, wizard, client.handler)
-        client.get_xpub('m', 'standard')
+        wizard.run_task_without_blocking_gui(
+            task=lambda: client.get_xpub("m", 'standard'))
         client.used()
+        return client
 
     def get_xpub(self, device_id, derivation, xtype, wizard):
         if xtype not in self.SUPPORTED_XTYPES:
             raise ScriptTypeNotSupported(_('This type of script is not supported with {}.').format(self.device))
-        devmgr = self.device_manager()
-        client = devmgr.client_by_id(device_id)
-        client.handler = wizard
+        client = self.scan_and_create_client_for_device(device_id=device_id, wizard=wizard)
         xpub = client.get_xpub(derivation, xtype)
         client.used()
         return xpub
@@ -342,7 +358,7 @@ class KeepKeyPlugin(HW_PluginBase):
         inputs = []
         for txin in tx.inputs():
             txinputtype = self.types.TxInputType()
-            if txin.is_coinbase():
+            if txin.is_coinbase_input():
                 prev_hash = b"\x00"*32
                 prev_index = 0xffffffff  # signed int -1
             else:
